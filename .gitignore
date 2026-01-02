@@ -1,0 +1,31 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.spec
+
+# --- Data (CRITICAL: Do not commit financial data) ---
+data_processed/
+data_raw/
+*.csv
+*.xlsx
+*.txt
+
+# --- IDE / OS Settings ---
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# --- Backtest Reports & Logs ---
+*.html
+*.log
+output/
+reports/
+
+# --- Temporary ---
+temp/
+
+# --- venv ---
+homeenv/
+myenv/
