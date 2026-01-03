@@ -8,7 +8,7 @@ import os
 
 class NQDualTrend(BaseStrategy):
     """
-    NQ Dual Trend Strategy (Pure Manual Mode)
+    NQ Dual Trend Strategy (No Cool-down, Enhanced Logging)
     """
     
     # ==========================================
@@ -43,6 +43,9 @@ class NQDualTrend(BaseStrategy):
         self.debug_signal_short = self.I(self.calc_signal_short_array, name='Signal_Short', color='red', scatter=True)
         self.debug_signal_long = self.I(self.calc_signal_long_array, name='Signal_Long', color='green', scatter=True)
         self.debug_deduction_dots = self.I(self.calc_deduction_marker_array, name='Deduction', color='orange', scatter=True)
+
+        self.last_trade_count = 0 
+        self.handled_trade_entries = set()
 
         self.log_file = 'log_dual_trend.txt'
         try:
@@ -101,14 +104,18 @@ class NQDualTrend(BaseStrategy):
     def next(self):
         current_time = self.data.index[-1]
 
-        # [CLEANUP] 移除了讀取 self.closed_trades 的迴圈
-        # 因為我們現在全權負責紀錄，不看引擎的報告
-
-        # --- 0.5 ORDER MONITOR ---
+        # --- 0.5 ORDER MONITOR (Enhanced) ---
         if len(self.orders) > 0:
             for order in list(self.orders):
                 limit_price = order.limit if order.limit else 0
                 side = "LONG" if order.size > 0 else "SHORT"
+                
+                # [DEBUG] Distinguish Market Exit vs Limit Entry
+                if order.limit is None and order.stop is None:
+                    self.log(f"[ORDER MONITOR] PENDING MARKET EXIT (Size: {order.size}) - Closing Position")
+                    continue
+                
+                # Entry Order Logic
                 order_type = "ENTRY"
                 bar_high = self.data.High[-1]
                 bar_low = self.data.Low[-1]
@@ -127,26 +134,32 @@ class NQDualTrend(BaseStrategy):
                         self.log(f"[CANCEL] Pre-emptive TP hit.")
                         continue
                 
-                self.log(f"[ORDER MONITOR] {side} Limit @ {limit_price} | Bar: {bar_low}-{bar_high}")
+                self.log(f"[ORDER MONITOR] PENDING LIMIT ENTRY {side} @ {limit_price} | Bar: {bar_low}-{bar_high}")
 
         # ============================================================
         # 1. POSITION MANAGEMENT
         # ============================================================
         if self.position:
-            # 這是唯一的出場檢查點
-            # 它會檢查 TP1, Initial SL, Runner SL, MA Exit
-            # 如果觸發，它會紀錄並執行 self.position.close()
             self.check_and_execute_scale_out(ma_price=self.ma20_2m[-1])
             return
 
         # ============================================================
-        # 2. CHECKS
+        # 2. ORDER CLEANUP
         # ============================================================
-        if len(self.data) < 60: return
-        if not (self.p_start_time <= current_time.time() <= self.p_end_time): return
+        if len(self.orders) > 0:
+            self.log(f"[ORDER CLEANUP] Flat position. Cancelling {len(self.orders)} stale orders.")
+            for o in self.orders: o.cancel()
 
         # ============================================================
-        # 3. SIGNAL LOGIC
+        # 3. CHECKS
+        # ============================================================
+        if len(self.data) < 60: return
+        #if not (self.p_start_time <= current_time.time() <= self.p_end_time): return
+        
+        # [REMOVED] Cool-down Check
+
+        # ============================================================
+        # 4. SIGNAL LOGIC
         # ============================================================
         is_short = (self.debug_signal_short[-1] == 1)
         is_long = (self.debug_signal_long[-1] == 1)
@@ -158,21 +171,14 @@ class NQDualTrend(BaseStrategy):
         close = self.data.Close[-1]
 
         # ============================================================
-        # 4. EXECUTION
+        # 5. EXECUTION
         # ============================================================
         if is_short or is_long:
-            if len(self.orders) > 0:
-                self.log(f"[INFO] {current_time} | New Signal -> Cancelling {len(self.orders)} old orders.")
-                for o in self.orders: o.cancel()
-
             dir_str = "SHORT" if is_short else "LONG"
-            log_msg = (
-                f"\n[SIGNAL] {current_time} | Direction: {dir_str}\n"
-                f"  Spread: {spread:.2f} (Threshold: {self.p_spread_threshold})\n"
-                f"  MA20: {ma20:.2f} | MA43: {ma43:.2f}\n"
-                f"  Price: {close:.2f} | 5m MA: {ma20_5m_val:.2f}"
-            )
-            self.log(log_msg)
+            self.log(f"\n[SIGNAL FOUND] {current_time} | {dir_str}")
+            self.log(f"  Spread: {spread:.2f} (>={self.p_spread_threshold})")
+            self.log(f"  MA20: {ma20:.2f} | MA43: {ma43:.2f}")
+            self.log(f"  Price: {close:.2f} | 5m MA: {ma20_5m_val:.2f}")
 
             target_direction = 0
             raw_limit_price = 0.0

@@ -6,7 +6,7 @@ from typing import List, Dict, Any, Optional, Union
 
 class BaseStrategy(Strategy):
     """
-    Base Strategy: Pure Manual Mode (Fixed Entry Time)
+    Base Strategy: Pure Manual Mode (No Cool-down)
     """
     
     # --- Default Parameters ---
@@ -25,6 +25,8 @@ class BaseStrategy(Strategy):
         self.entry_time_marker: Optional[pd.Timestamp] = None
         self.partial_exit_done: bool = False 
         self.log_file = None 
+        self.manually_closed_trades = set()
+        # [REMOVED] Cool-down counter
 
     def log(self, message: str):
         if self.log_file:
@@ -62,8 +64,14 @@ class BaseStrategy(Strategy):
             is_tp_hit = high >= tp_price
             is_close_win = close >= tp_price
 
+        # Reverse Fill Protection
+        if direction == -1 and open_p < entry_price:
+            if is_tp_hit and not is_close_win: is_tp_hit = False 
+        if direction == 1 and open_p > entry_price:
+            if is_tp_hit and not is_close_win: is_tp_hit = False
+
         if is_sl_hit and not is_tp_hit: return 'SL'
-        if not is_sl_hit and is_close_win: return 'TP'
+        if not is_sl_hit and is_tp_hit: return 'TP'
         if not is_sl_hit and not is_tp_hit: return 'HOLD'
 
         dist_open_to_high = abs(open_p - high)
@@ -101,127 +109,143 @@ class BaseStrategy(Strategy):
         })
 
     # ============================================================
-    # [CORE] Pure Manual Exit Logic (Fixed Entry Time)
+    # [CORE] Pure Manual Exit Logic
     # ============================================================
     def check_and_execute_scale_out(self, ma_price: float):
         if not self.position: return
 
-        # 取得當前持倉資訊
         current_trade = self.trades[-1]
         direction = 1 if self.position.is_long else -1
         
-        # [CRITICAL FIX]
-        # 強制使用引擎回報的 entry_time (成交 K 棒時間)，而不是掛單時的時間。
-        # 這樣可以修正 Report 提早一根 K 棒的問題。
         self.ideal_entry_price = current_trade.entry_price
         self.entry_time_marker = current_trade.entry_time
 
-        # --- Phase 1: 尚未分批出場 (檢查 TP1 和 初始 SL) ---
+        current_time = self.data.index[-1]
+        is_entry_bar = (current_trade.entry_time == current_time)
+
+        tp1_triggered = False
+        runner_triggered = False
+        remaining_qty = abs(self.position.size)
+        self.log(f"[Check and Exec Scale Out] {current_time}, Remain >> {remaining_qty} << Position")
+
+        # --- Phase 1: TP1 & Initial SL ---
         if not self.partial_exit_done:
-            if direction == -1: # Short
+            if direction == -1:
                 tp1_price = self.ideal_entry_price - self.p_tp_points
                 sl_price = self.ideal_entry_price + self.p_sl_points
-            else: # Long
+            else:
                 tp1_price = self.ideal_entry_price + self.p_tp_points
                 sl_price = self.ideal_entry_price - self.p_sl_points
             
-            # 檢查是否觸發
-            hit_sl = (self.data.High[-1] >= sl_price) if direction == -1 else (self.data.Low[-1] <= sl_price)
-            hit_tp = (self.data.Low[-1] <= tp1_price) if direction == -1 else (self.data.High[-1] >= tp1_price)
-            
             outcome = 'HOLD'
-            if hit_sl and hit_tp: outcome = 'SL' # 保守判定
-            elif hit_sl: outcome = 'SL'
-            elif hit_tp: outcome = 'TP'
+            if is_entry_bar:
+                outcome = self.check_intra_bar_outcome(
+                    self.data.Open[-1], self.data.High[-1], self.data.Low[-1], self.data.Close[-1],
+                    self.ideal_entry_price, sl_price, tp1_price, self.data.index[-1], direction
+                )
+            else:
+                hit_sl = (self.data.High[-1] >= sl_price) if direction == -1 else (self.data.Low[-1] <= sl_price)
+                hit_tp = (self.data.Low[-1] <= tp1_price) if direction == -1 else (self.data.High[-1] >= tp1_price)
+                if hit_sl: outcome = 'SL'
+                elif hit_tp: outcome = 'TP'
 
             if outcome == 'TP':
                 exit_qty = self._calc_exit_qty()
                 
-                # [MANUAL ACTION] 平掉部分倉位
                 if direction == -1: self.buy(size=exit_qty)
                 else: self.sell(size=exit_qty)
                 
                 self.record_trade(
                     entry_time=self.entry_time_marker,
-                    exit_time=self.data.index[-1],
+                    exit_time=current_time,
                     entry_price=self.ideal_entry_price,
                     exit_price=tp1_price,
                     pnl=self.p_tp_points,
                     size=direction * exit_qty,
                     outcome_type='TP1 (Partial)'
                 )
+                self.manually_closed_trades.add((self.entry_time_marker, current_time))
                 self.partial_exit_done = True
+                tp1_triggered = True
+                remaining_qty -= exit_qty
                 
-                # 如果是全出 (例如 trade_size=1)，則重置
-                if exit_qty == self.trade_size:
-                    self.ideal_entry_price = None
-                    return
+                self.log(f"  [EXEC] TP1 Triggered. Closing {exit_qty} units. Remain >> {remaining_qty} << Position")
 
             elif outcome == 'SL':
-                # [MANUAL ACTION] 全倉停損
+                self.log(f"  [EXIT EXEC] SL Triggered. Submitting Market Close. ++++ ")
                 self.position.close()
-                
+                self.log(f"  [EXIT EXEC] SL Triggered. Submitting Market Close. Remain >> {remaining_qty} << Position")
                 self.record_trade(
                     entry_time=self.entry_time_marker,
-                    exit_time=self.data.index[-1],
+                    exit_time=current_time,
                     entry_price=self.ideal_entry_price,
                     exit_price=sl_price,
                     pnl=-self.p_sl_points,
                     size=direction * self.trade_size,
                     outcome_type='SL (Full)'
                 )
+                self.manually_closed_trades.add((self.entry_time_marker, current_time))
                 self.ideal_entry_price = None
                 return
 
-        # --- Phase 2: 已經分批出場 (檢查 Runner SL 和 MA Exit) ---
-        else:
+        # --- Phase 2: Runner (MA Exit / Runner SL) ---
+        if self.partial_exit_done and remaining_qty > 0:
+            
             if direction == -1: runner_sl = self.ideal_entry_price + self.p_runner_sl_offset
             else: runner_sl = self.ideal_entry_price - self.p_runner_sl_offset
             
             ma_exit = False
             if direction == -1: 
-                if self.data.Close[-1] > ma_price: ma_exit = True
+                if self.data.Low[-1] <= ma_price: ma_exit = True 
             else: 
-                if self.data.Close[-1] < ma_price: ma_exit = True
+                if self.data.High[-1] >= ma_price: ma_exit = True 
             
             hit_runner_sl = (self.data.High[-1] >= runner_sl) if direction == -1 else (self.data.Low[-1] <= runner_sl)
             
-            final_exit = False
             exit_type = ''
             exit_px = 0.0
             pnl_pts = 0.0
 
             if hit_runner_sl:
-                final_exit = True
+                runner_triggered = True
                 exit_type = 'Runner SL'
                 exit_px = runner_sl
                 pnl_pts = -self.p_runner_sl_offset
             elif ma_exit:
-                final_exit = True
+                runner_triggered = True
                 exit_type = 'MA Exit'
-                exit_px = self.data.Close[-1]
+                exit_px = ma_price
                 if direction == -1: pnl_pts = self.ideal_entry_price - exit_px
                 else: pnl_pts = exit_px - self.ideal_entry_price
 
-            if final_exit:
-                # [MANUAL ACTION] 平掉剩餘倉位
-                self.position.close()
-                remaining_size = self.position.size 
+            if runner_triggered:
+                self.log(f"  [EXIT EXEC] {exit_type} Triggered. Submitting Market Close. Remain >> {remaining_qty} << Position")
+                runner_size = direction * remaining_qty
                 
                 self.record_trade(
                     entry_time=self.entry_time_marker,
-                    exit_time=self.data.index[-1],
+                    exit_time=current_time,
                     entry_price=self.ideal_entry_price,
                     exit_price=exit_px,
                     pnl=pnl_pts,
-                    size=remaining_size,
+                    size=runner_size,
                     outcome_type=exit_type
                 )
+                self.manually_closed_trades.add((self.entry_time_marker, current_time))
                 self.ideal_entry_price = None
                 self.partial_exit_done = False
 
+        # --- Phase 3: Execution ---
+        if runner_triggered:
+            self.log(f"  [EXIT EXEC] {exit_type} Triggered. Position Close. ++++")
+            if direction == -1: self.buy(size=1)
+            else: self.sell(size=1)
+            self.log(f"  [EXIT EXEC] {exit_type} Triggered. Position Close. ---- Remain >> {remaining_qty} << Position")
+        elif tp1_triggered:
+            pass
+
     # ============================================================
-    # [MODIFIED] Entry Logic (No Engine SL/TP)
+    # [MODIFIED] Entry Logic
     # ============================================================
     def execute_entry_with_intrabar_check(self, direction: int, raw_limit_price: float, sl_points: float, tp_points: float, trade_size: int):
         current_time = self.data.index[-1]
@@ -234,7 +258,6 @@ class BaseStrategy(Strategy):
             target_sl = limit_price + sl_points
             target_tp = limit_price - tp_points
 
-        # 1. Intra-bar 模擬 (檢查是否在進場這根 K 棒就直接出場)
         outcome = self.check_intra_bar_outcome(
             self.data.Open[-1], self.data.High[-1], self.data.Low[-1], self.data.Close[-1],
             limit_price, target_sl, target_tp, current_time, direction
@@ -243,7 +266,6 @@ class BaseStrategy(Strategy):
         self.partial_exit_done = False
 
         if outcome == 'SL' or outcome == 'TP':
-            # 進場當下即出場，直接紀錄，不掛單
             pnl_points_per_unit = -sl_points if outcome == 'SL' else tp_points
             exit_px = target_sl if outcome == 'SL' else target_tp
             
@@ -259,17 +281,15 @@ class BaseStrategy(Strategy):
             return True
 
         elif outcome == 'HOLD':
-            # 這裡設定的 entry_time_marker 只是暫時的 (掛單時間)
-            # 真正成交後，check_and_execute_scale_out 會用 current_trade.entry_time 覆蓋它
             self.ideal_entry_price = limit_price
             self.entry_time_marker = current_time
             
             if direction == 1:
                 self.buy(limit=limit_price, size=trade_size) 
-                self.log(f"[ORDER PLACED] LONG Limit @ {limit_price} (Pure Manual)")
+                self.log(f"[ORDER PLACED] LONG Limit @ {limit_price}")
             else:
                 self.sell(limit=limit_price, size=trade_size)
-                self.log(f"[ORDER PLACED] SHORT Limit @ {limit_price} (Pure Manual)")
+                self.log(f"[ORDER PLACED] SHORT Limit @ {limit_price}")
             
             return False
 
