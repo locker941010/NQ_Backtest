@@ -20,8 +20,8 @@ class NQDualTrend(BaseStrategy):
     p_deduction_ago = 34  
     p_entry_offset = 2.0  
     p_tolerance = 1.0     
-    p_start_time = time(2, 0)
-    p_end_time = time(16, 0)
+    p_start_time = time(15, 0)
+    p_end_time = time(4, 0)
     p_sl_points = 16.0      
     p_tp_points = 20.0      
     p_runner_sl_offset = 7.0 
@@ -154,7 +154,17 @@ class NQDualTrend(BaseStrategy):
         # 3. CHECKS
         # ============================================================
         if len(self.data) < 60: return
-        #if not (self.p_start_time <= current_time.time() <= self.p_end_time): return
+        t = current_time.time()
+        is_trading_time = False
+        
+        if self.p_start_time > self.p_end_time:
+            # 跨日 (例如 15:00 ~ 02:00)
+            # 時間必須 >= 15:00 或者 <= 02:00
+            if t >= self.p_start_time or t <= self.p_end_time:
+                is_trading_time = True
+        
+        if not is_trading_time:
+            return
         
         # [REMOVED] Cool-down Check
 

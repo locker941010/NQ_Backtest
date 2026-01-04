@@ -64,11 +64,12 @@ class BaseStrategy(Strategy):
             is_tp_hit = high >= tp_price
             is_close_win = close >= tp_price
 
+
         # Reverse Fill Protection
-        if direction == -1 and open_p < entry_price:
-            if is_tp_hit and not is_close_win: is_tp_hit = False 
-        if direction == 1 and open_p > entry_price:
-            if is_tp_hit and not is_close_win: is_tp_hit = False
+        #if direction == -1 and open_p < entry_price:
+        #    if is_tp_hit and not is_close_win: is_tp_hit = False 
+        #if direction == 1 and open_p > entry_price:
+        #    if is_tp_hit and not is_close_win: is_tp_hit = False
 
         if is_sl_hit and not is_tp_hit: return 'SL'
         if not is_sl_hit and is_tp_hit: return 'TP'
