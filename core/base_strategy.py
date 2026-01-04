@@ -161,6 +161,7 @@ class BaseStrategy(Strategy):
             # 執行 Phase 1 離場
             if outcome == 'TP':
                 exit_qty = self._calc_exit_qty()
+                
                 if direction == -1: self.buy(size=exit_qty)
                 else: self.sell(size=exit_qty)
                 
@@ -261,8 +262,9 @@ class BaseStrategy(Strategy):
         current_trade = self.trades[-1]
         direction = 1 if self.position.is_long else -1
         
-        self.ideal_entry_price = current_trade.entry_price
-        self.entry_time_marker = current_trade.entry_time
+        if self.ideal_entry_price is None:
+            self.ideal_entry_price = current_trade.entry_price
+            self.entry_time_marker = current_trade.entry_time
 
         current_time = self.data.index[-1]
         is_entry_bar = (current_trade.entry_time == current_time)
@@ -388,13 +390,15 @@ class BaseStrategy(Strategy):
         elif tp1_triggered:
             pass
 
+    
     # ============================================================
-    # [MODIFIED] Entry Logic
+    # [MODIFIED] Entry Logic with Built-in Scale-out Support
     # ============================================================
     def execute_entry_with_intrabar_check(self, direction: int, raw_limit_price: float, sl_points: float, tp_points: float, trade_size: int):
         current_time = self.data.index[-1]
         limit_price = self.round_to_tick(raw_limit_price)
 
+        # 計算目標價
         if direction == 1:
             target_sl = limit_price - sl_points
             target_tp = limit_price + tp_points
@@ -402,29 +406,66 @@ class BaseStrategy(Strategy):
             target_sl = limit_price + sl_points
             target_tp = limit_price - tp_points
 
+        # 檢查當根 K 棒是否成交且觸發出場
         outcome = self.check_intra_bar_outcome(
             self.data.Open[-1], self.data.High[-1], self.data.Low[-1], self.data.Close[-1],
             limit_price, target_sl, target_tp, current_time, direction
         )
 
-        self.partial_exit_done = False
-
-        if outcome == 'SL' or outcome == 'TP':
-            pnl_points_per_unit = -sl_points if outcome == 'SL' else tp_points
-            exit_px = target_sl if outcome == 'SL' else target_tp
+        if outcome == 'TP':
+            # --- [修正] Intra-bar TP 支援分批出場 ---
             
+            # 1. 計算口數分配
+            exit_qty = self._calc_exit_qty()    # 根據設定計算 TP 口數
+            runner_qty = trade_size - exit_qty  # 計算剩餘 Runner 口數
+            
+            # 2. 紀錄 TP1 獲利 (只紀錄出場的那部分)
             self.record_trade(
                 entry_time=current_time,
                 exit_time=current_time,
                 entry_price=limit_price,
-                exit_price=exit_px,
-                pnl=pnl_points_per_unit,
+                exit_price=target_tp,
+                pnl=tp_points,
+                size=direction * exit_qty,
+                outcome_type='TP1 (Intra-bar)'
+            )
+            
+            # 3. 處理 Runner
+            if runner_qty > 0:
+                # 設定狀態，讓下一根 K 棒知道我們已經出過一次了
+                self.partial_exit_done = True
+                self.ideal_entry_price = limit_price
+                self.entry_time_marker = current_time
+                
+                # 強制建立 Runner 部位
+                # 因為 Intra-bar 邏輯判定進場點已成交，所以這裡直接用市價單建立剩餘部位
+                self.log(f"[INTRA-BAR] Entry filled & TP1 hit. Holding Runner ({runner_qty}).")
+                if direction == 1:
+                    self.buy(size=runner_qty) 
+                else:
+                    self.sell(size=runner_qty)
+            else:
+                # 如果沒有 Runner (例如 trade_size=1 且全出)，則就此結束
+                self.log(f"[INTRA-BAR] Entry filled & Full TP hit.")
+
+            return True
+
+        elif outcome == 'SL':
+            # Intra-bar 直接停損 (通常 SL 都是全出)
+            self.record_trade(
+                entry_time=current_time,
+                exit_time=current_time,
+                entry_price=limit_price,
+                exit_price=target_sl,
+                pnl=-sl_points,
                 size=direction * trade_size,
-                outcome_type=f"Intra-Bar {outcome}"
+                outcome_type='SL (Intra-bar)'
             )
             return True
 
         elif outcome == 'HOLD':
+            # 正常進場 (當根 K 棒沒出場，掛 Limit 單)
+            self.partial_exit_done = False # 重置狀態
             self.ideal_entry_price = limit_price
             self.entry_time_marker = current_time
             
@@ -438,7 +479,6 @@ class BaseStrategy(Strategy):
             return False
 
         return False
-
     @abstractmethod
     def next(self):
         pass
